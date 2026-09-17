@@ -1,0 +1,211 @@
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+#include "Wire.h"
+
+MPU6050 mpu;
+
+Quaternion q;
+VectorFloat gravity;
+float ypr[3];
+
+uint8_t FIFOBuffer[64];
+
+float setpoint = 0;
+
+// ---------- Motor Pins ----------
+const int ENA = 5;
+const int IN1 = 8;
+const int IN2 = 9;
+
+const int ENB = 6;
+const int IN3 = 10;
+const int IN4 = 11;
+
+// ---------- Control Parameters ----------
+float previousError = 0;
+unsigned long previousTime = 0;
+
+const float Kp = 43;
+const float Ki = 0.0;      // Start at 0, tune ONLY after Kp and Kd are perfect
+const float Kd = 2.5;      
+const float deadband = 0.2; // Changed from 2 to 0.2 degrees
+
+float errorSum = 0;            // Holds the accumulated error for the I-term
+const float maxErrorSum = 400; // Anti-windup limit to prevent runaway motors
+
+// ---------- Motor Functions ----------
+void forwardMotor(int speed)
+{
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void backwardMotor(int speed)
+{
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void stopMotor()
+{
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  Serial.println("Initializing MPU6050...");
+
+  mpu.initialize();
+
+  if (!mpu.testConnection())
+  {
+    Serial.println("MPU6050 failed");
+    while (1);
+  }
+
+  Serial.println("MPU6050 connected");
+
+  if (mpu.dmpInitialize() != 0)
+  {
+    Serial.println("DMP initialization failed");
+    while (1);
+  }
+
+  mpu.setDMPEnabled(true);
+
+  Serial.println();
+  Serial.println("Hold robot upright");
+  Serial.println("Calibration starting...");
+
+  delay(1000);
+
+  float sum = 0;
+  int count = 0;
+
+  while (count < 300)
+  {
+    if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer))
+    {
+      mpu.dmpGetQuaternion(&q, FIFOBuffer);
+      mpu.dmpGetGravity(&gravity, &q);
+      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+      float pitch = ypr[1] * 180.0 / M_PI;
+
+      sum += pitch;
+      count++;
+
+      if (count % 100 == 0)
+      {
+        Serial.print("Samples: ");
+        Serial.println(count);
+      }
+    }
+  }
+
+  setpoint = sum / 300.0;
+
+  Serial.println();
+  Serial.print("Setpoint = ");
+  Serial.println(setpoint, 4);
+
+  previousTime = micros();
+
+  Serial.println("Starting control...");
+}
+
+void loop()
+{
+  if (!mpu.dmpGetCurrentFIFOPacket(FIFOBuffer))
+    return;
+
+  mpu.dmpGetQuaternion(&q, FIFOBuffer);
+  mpu.dmpGetGravity(&gravity, &q);
+  mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+  float pitch = ypr[1] * 180.0 / M_PI;
+  float error = pitch - setpoint;
+
+  unsigned long currentTime = micros();
+  float dt = (currentTime - previousTime) / 1000000.0;
+  if (dt <= 0) dt = 0.001; // Prevent divide by zero
+
+  // Print block
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 100)
+  {
+    Serial.print("Pitch: "); Serial.print(pitch);
+    Serial.print(" | Error: "); Serial.print(error);
+    Serial.println();
+    lastPrint = millis();
+  }
+
+  // Calculate Integral Term with Anti-Windup
+  errorSum += (error * dt);
+  errorSum = constrain(errorSum, -maxErrorSum, maxErrorSum);
+
+  // Deadband check
+  if (abs(error) < deadband)
+  {
+    stopMotor();
+    previousError = error;
+    previousTime = micros();
+    errorSum = 0; // Clear the accumulated error when perfectly balanced
+    return;
+  }
+
+  float derivative = (error - previousError) / dt;
+  
+  // The full PID Output Equation
+  float output = (Kp * error) + (Ki * errorSum) + (Kd * derivative);
+
+  previousError = error;
+  previousTime = currentTime;
+
+  int speed = abs(output);
+
+  // Minimum PWM needed to overcome motor friction
+  speed = constrain(speed, 85, 255);
+
+  // DIRECTION DECIDED BY OUTPUT
+  if (output > 0) 
+  {
+    backwardMotor(speed); 
+  }
+  else
+  {
+    forwardMotor(speed);
+  }
+}
